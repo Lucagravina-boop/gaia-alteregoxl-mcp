@@ -1,5 +1,5 @@
-// GAIA ALTEREGOXL MCP Server v1.2.0
-// Node.js per Render.com — bypass SSL per areariservata.alteregoxl.it
+// GAIA ALTEREGOXL MCP Server v1.2.1
+// Node.js per Render.com
 
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
@@ -11,7 +11,7 @@ const { URL } = require("url");
 const app = express();
 app.use(express.json());
 
-const WORKER_VERSION = "1.2.0";
+const WORKER_VERSION = "1.2.1";
 const STATION_ID = "DOT_OHIILHBG";
 const ALTEREGO_BASE = "https://areariservata.alteregoxl.it";
 const ALTEREGO_EMAIL = process.env.ALTEREGO_EMAIL || "";
@@ -38,11 +38,7 @@ function rawFetch(urlStr, options = {}) {
       let body = "";
       res.on("data", (chunk) => { body += chunk; });
       res.on("end", () => {
-        resolve({
-          status: res.statusCode,
-          headers: res.headers,
-          body
-        });
+        resolve({ status: res.statusCode, headers: res.headers, body });
       });
     });
 
@@ -69,7 +65,6 @@ function extractCookies(headers) {
 }
 
 function mergeCookieString(existing, newCookies) {
-  // Parse existing cookie string into map
   const map = {};
   if (existing) {
     for (const part of existing.split("; ")) {
@@ -77,20 +72,24 @@ function mergeCookieString(existing, newCookies) {
       if (eq > 0) map[part.substring(0, eq)] = part.substring(eq + 1);
     }
   }
-  // Merge new cookies
   for (const [k, v] of Object.entries(newCookies)) {
     map[k] = v;
   }
-  // Rebuild string
   return Object.entries(map).map(([k, v]) => `${k}=${v}`).join("; ");
 }
 
+function getXsrfFromCookieStr(cookieStr) {
+  const match = cookieStr.match(/XSRF-TOKEN=([^;]+)/);
+  if (match) return decodeURIComponent(match[1]);
+  return "";
+}
+
 // ============================================================
-// LOGIN (3 steps: GET /login, POST /login, GET /home)
+// LOGIN (3 steps)
 // ============================================================
 
 async function loginAlterEgo() {
-  // Step 1: GET /login → CSRF + cookies
+  // Step 1: GET /login
   const step1 = await rawFetch(`${ALTEREGO_BASE}/login`, {
     headers: { "User-Agent": "GAIA-AlterEgoXL/1.2" }
   });
@@ -106,9 +105,7 @@ async function loginAlterEgo() {
   const csrfToken = decodeURIComponent(xsrfToken);
   let cookieStr = `XSRF-TOKEN=${xsrfToken}; laravel_session=${laravelSession}`;
 
-  // Step 2: POST /login → 302 to /home
-  const postBody = `_token=${encodeURIComponent(csrfToken)}&email=${encodeURIComponent(ALTEREGO_EMAIL)}&password=${encodeURIComponent(ALTEREGO_PASSWORD)}`;
-
+  // Step 2: POST /login
   const step2 = await rawFetch(`${ALTEREGO_BASE}/login`, {
     method: "POST",
     headers: {
@@ -116,32 +113,32 @@ async function loginAlterEgo() {
       "Cookie": cookieStr,
       "User-Agent": "GAIA-AlterEgoXL/1.2"
     },
-    body: postBody
+    body: `_token=${encodeURIComponent(csrfToken)}&email=${encodeURIComponent(ALTEREGO_EMAIL)}&password=${encodeURIComponent(ALTEREGO_PASSWORD)}`
   });
 
   if (step2.status !== 302) {
     return { cookie: "", ok: false, error: "Login POST non 302", status: step2.status };
   }
 
-  // Merge cookies from step 2
   const cookies2 = extractCookies(step2.headers);
   cookieStr = mergeCookieString(cookieStr, cookies2);
 
-  // Step 3: Follow redirect to /home to activate session
+  // Step 3: Follow redirect to /home
   const location = step2.headers["location"] || `${ALTEREGO_BASE}/home`;
   const step3 = await rawFetch(location, {
     headers: {
       "Cookie": cookieStr,
-      "User-Agent": "GAIA-AlterEgoXL/1.2"
+      "User-Agent": "GAIA-AlterEgoXL/1.2",
+      "X-Requested-With": "XMLHttpRequest"
     }
   });
 
-  // Merge cookies from step 3
   const cookies3 = extractCookies(step3.headers);
   cookieStr = mergeCookieString(cookieStr, cookies3);
 
   return {
     cookie: cookieStr,
+    xsrfDecoded: getXsrfFromCookieStr(cookieStr),
     ok: true,
     status: step2.status,
     location: location,
@@ -161,7 +158,9 @@ async function authFetch(url) {
     headers: {
       "Cookie": login.cookie,
       "User-Agent": "GAIA-AlterEgoXL/1.2",
-      "Accept": "application/json"
+      "Accept": "application/json, text/javascript, */*; q=0.01",
+      "X-Requested-With": "XMLHttpRequest",
+      "X-XSRF-TOKEN": login.xsrfDecoded
     }
   });
 
@@ -170,6 +169,29 @@ async function authFetch(url) {
   } catch {
     return { raw: resp.body.substring(0, 500), status: resp.status };
   }
+}
+
+// ============================================================
+// AUTHENTICATED WRITE
+// ============================================================
+
+async function authWrite(url) {
+  const login = await loginAlterEgo();
+  if (!login.ok) return { success: false, error: `Login fallito: ${login.error}` };
+
+  const resp = await rawFetch(url, {
+    headers: {
+      "Cookie": login.cookie,
+      "User-Agent": "GAIA-AlterEgoXL/1.2",
+      "Accept": "application/json, text/javascript, */*; q=0.01",
+      "X-Requested-With": "XMLHttpRequest",
+      "X-XSRF-TOKEN": login.xsrfDecoded
+    }
+  });
+
+  let json;
+  try { json = JSON.parse(resp.body); } catch { json = null; }
+  return { status: resp.status, json, body: resp.body.substring(0, 300) };
 }
 
 // ============================================================
@@ -281,7 +303,6 @@ async function leggiImpianto() {
     if (props[`C${i}_RET_TEMP`] !== undefined && Number(props[`C${i}_RET_TEMP`]) !== 32768) {
       circ.temp_ritorno = formatD10(props[`C${i}_RET_TEMP`]) + " °C";
     }
-
     result.circuiti.push(circ);
   }
 
@@ -307,28 +328,15 @@ async function leggiImpianto() {
 // ============================================================
 
 async function scriviProprieta(propId, valore) {
-  const login = await loginAlterEgo();
-  if (!login.ok) return { success: false, error: `Login fallito: ${login.error}` };
-
   const url = `${ALTEREGO_BASE}/${STATION_ID}/putmprop?statid=${STATION_ID}&userid=guest&pcount=1&p0=${encodeURIComponent(propId)}&nb0=${encodeURIComponent(valore)}`;
-
-  const resp = await rawFetch(url, {
-    headers: {
-      "Cookie": login.cookie,
-      "User-Agent": "GAIA-AlterEgoXL/1.2",
-      "Accept": "application/json"
-    }
-  });
-
-  let json;
-  try { json = JSON.parse(resp.body); } catch { json = null; }
+  const resp = await authWrite(url);
 
   return {
     success: resp.status === 200,
     propId,
     valore,
     status: resp.status,
-    response: json || resp.body.substring(0, 200)
+    response: resp.json || resp.body
   };
 }
 
@@ -340,11 +348,7 @@ const TOOLS = [
   {
     name: "leggi_impianto",
     description: "Legge tutti i dati live dell'impianto Cappellotto AlterEgo di Via Borgazzi 12: stato impianto, stagione, ACS, temperature zone, setpoint, umidità, circuiti, allarmi.",
-    inputSchema: {
-      type: "object",
-      properties: {},
-      required: []
-    }
+    inputSchema: { type: "object", properties: {}, required: [] }
   },
   {
     name: "scrivi_proprieta",
@@ -352,14 +356,8 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        prop_id: {
-          type: "string",
-          description: "ID della proprietà da scrivere"
-        },
-        valore: {
-          type: "number",
-          description: "Valore numerico. Temperature: x10 (21.5°C=215). Booleani: 0/1. Forzatura: 0=auto,1=off,3=comfort."
-        }
+        prop_id: { type: "string", description: "ID della proprietà da scrivere" },
+        valore: { type: "number", description: "Valore numerico. Temperature: x10 (21.5°C=215). Booleani: 0/1." }
       },
       required: ["prop_id", "valore"]
     }
@@ -374,17 +372,13 @@ async function handleMcpRequest(method, params) {
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: "gaia-alteregoxl-mcp", version: WORKER_VERSION }
       };
-
     case "tools/list":
       return { tools: TOOLS };
-
     case "tools/call":
       return await handleToolCall(params);
-
     case "notifications/initialized":
     case "notifications/cancelled":
       return null;
-
     default:
       throw { code: -32601, message: `Method not found: ${method}` };
   }
@@ -392,33 +386,22 @@ async function handleMcpRequest(method, params) {
 
 async function handleToolCall(params) {
   const { name, arguments: args } = params;
-
   try {
     let result;
     switch (name) {
       case "leggi_impianto":
         result = await leggiImpianto();
         break;
-
       case "scrivi_proprieta":
-        if (!args?.prop_id || args?.valore === undefined) {
-          throw new Error("Parametri obbligatori: prop_id, valore");
-        }
+        if (!args?.prop_id || args?.valore === undefined) throw new Error("Parametri obbligatori: prop_id, valore");
         result = await scriviProprieta(args.prop_id, args.valore);
         break;
-
       default:
         throw new Error(`Tool sconosciuto: ${name}`);
     }
-
-    return {
-      content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
-    };
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
-    return {
-      content: [{ type: "text", text: JSON.stringify({ error: err.message }) }],
-      isError: true
-    };
+    return { content: [{ type: "text", text: JSON.stringify({ error: err.message }) }], isError: true };
   }
 }
 
@@ -436,46 +419,25 @@ app.use((req, res, next) => {
 });
 
 app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
-    version: WORKER_VERSION,
-    station: STATION_ID,
-    timestamp: new Date().toISOString()
-  });
+  res.json({ status: "ok", version: WORKER_VERSION, station: STATION_ID, timestamp: new Date().toISOString() });
 });
 
 app.get("/debug-login", async (req, res) => {
   try {
-    const result = await loginAlterEgo();
-    res.json({
-      ok: result.ok,
-      status: result.status,
-      location: result.location,
-      step3_status: result.step3_status,
-      cookieLength: result.cookie ? result.cookie.length : 0,
-      hasEmail: !!ALTEREGO_EMAIL,
-      hasPassword: !!ALTEREGO_PASSWORD
-    });
-  } catch (err) {
-    res.json({ error: err.message });
-  }
+    const r = await loginAlterEgo();
+    res.json({ ok: r.ok, status: r.status, location: r.location, step3_status: r.step3_status, cookieLength: r.cookie ? r.cookie.length : 0, hasXsrf: !!r.xsrfDecoded, hasEmail: !!ALTEREGO_EMAIL, hasPassword: !!ALTEREGO_PASSWORD });
+  } catch (err) { res.json({ error: err.message }); }
 });
 
 app.get("/debug-getres", async (req, res) => {
   try {
     const data = await authFetch(`${ALTEREGO_BASE}/${STATION_ID}/getres?timestamp=`);
-    const preview = {};
     if (data.Data && Array.isArray(data.Data)) {
-      preview.rowCount = data.Data.length;
-      preview.first5 = data.Data.slice(0, 5);
-      preview.timestamp = data.Timestamp;
+      res.json({ rowCount: data.Data.length, first5: data.Data.slice(0, 5), timestamp: data.Timestamp });
     } else {
-      preview.raw = data;
+      res.json({ raw: data });
     }
-    res.json(preview);
-  } catch (err) {
-    res.json({ error: err.message });
-  }
+  } catch (err) { res.json({ error: err.message }); }
 });
 
 app.get("/sse", (req, res) => {
@@ -483,40 +445,20 @@ app.get("/sse", (req, res) => {
   const protocol = req.headers["x-forwarded-proto"] || req.protocol;
   const host = req.headers.host;
   const messageUrl = `${protocol}://${host}/message?sessionId=${sessionId}`;
-
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive"
-  });
-
+  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" });
   res.write(`event: endpoint\ndata: ${messageUrl}\n\n`);
-
-  const keepAlive = setInterval(() => {
-    res.write(`: keepalive\n\n`);
-  }, 15000);
-
-  req.on("close", () => {
-    clearInterval(keepAlive);
-  });
+  const keepAlive = setInterval(() => { res.write(`: keepalive\n\n`); }, 15000);
+  req.on("close", () => { clearInterval(keepAlive); });
 });
 
 async function handlePost(req, res) {
   try {
     const { method, params, id } = req.body;
     const result = await handleMcpRequest(method, params);
-
-    if (result === null) {
-      return res.sendStatus(202);
-    }
-
+    if (result === null) return res.sendStatus(202);
     res.json({ jsonrpc: "2.0", id, result });
   } catch (err) {
-    res.json({
-      jsonrpc: "2.0",
-      id: null,
-      error: { code: err.code || -32603, message: err.message }
-    });
+    res.json({ jsonrpc: "2.0", id: null, error: { code: err.code || -32603, message: err.message } });
   }
 }
 
@@ -524,11 +466,5 @@ app.post("/message", handlePost);
 app.post("/mcp", handlePost);
 app.post("/", handlePost);
 
-// ============================================================
-// START
-// ============================================================
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`GAIA AlterEgoXL MCP v${WORKER_VERSION} running on port ${PORT}`);
-});
+app.listen(PORT, () => { console.log(`GAIA AlterEgoXL MCP v${WORKER_VERSION} on port ${PORT}`); });
