@@ -1,4 +1,4 @@
-// GAIA ALTEREGOXL MCP Server v1.1.0
+// GAIA ALTEREGOXL MCP Server v1.2.0
 // Node.js per Render.com — bypass SSL per areariservata.alteregoxl.it
 
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
@@ -11,14 +11,14 @@ const { URL } = require("url");
 const app = express();
 app.use(express.json());
 
-const WORKER_VERSION = "1.1.0";
+const WORKER_VERSION = "1.2.0";
 const STATION_ID = "DOT_OHIILHBG";
 const ALTEREGO_BASE = "https://areariservata.alteregoxl.it";
 const ALTEREGO_EMAIL = process.env.ALTEREGO_EMAIL || "";
 const ALTEREGO_PASSWORD = process.env.ALTEREGO_PASSWORD || "";
 
 // ============================================================
-// HTTP HELPER (follows redirects manually, skips SSL)
+// HTTP HELPER
 // ============================================================
 
 function rawFetch(urlStr, options = {}) {
@@ -53,7 +53,7 @@ function rawFetch(urlStr, options = {}) {
 }
 
 // ============================================================
-// COOKIE EXTRACTION
+// COOKIE HELPERS
 // ============================================================
 
 function extractCookies(headers) {
@@ -68,14 +68,31 @@ function extractCookies(headers) {
   return cookies;
 }
 
+function mergeCookieString(existing, newCookies) {
+  // Parse existing cookie string into map
+  const map = {};
+  if (existing) {
+    for (const part of existing.split("; ")) {
+      const eq = part.indexOf("=");
+      if (eq > 0) map[part.substring(0, eq)] = part.substring(eq + 1);
+    }
+  }
+  // Merge new cookies
+  for (const [k, v] of Object.entries(newCookies)) {
+    map[k] = v;
+  }
+  // Rebuild string
+  return Object.entries(map).map(([k, v]) => `${k}=${v}`).join("; ");
+}
+
 // ============================================================
-// LOGIN
+// LOGIN (3 steps: GET /login, POST /login, GET /home)
 // ============================================================
 
 async function loginAlterEgo() {
-  // Step 1: GET /login
+  // Step 1: GET /login → CSRF + cookies
   const step1 = await rawFetch(`${ALTEREGO_BASE}/login`, {
-    headers: { "User-Agent": "GAIA-AlterEgoXL/1.1" }
+    headers: { "User-Agent": "GAIA-AlterEgoXL/1.2" }
   });
 
   const cookies1 = extractCookies(step1.headers);
@@ -87,29 +104,48 @@ async function loginAlterEgo() {
   }
 
   const csrfToken = decodeURIComponent(xsrfToken);
+  let cookieStr = `XSRF-TOKEN=${xsrfToken}; laravel_session=${laravelSession}`;
 
-  // Step 2: POST /login
+  // Step 2: POST /login → 302 to /home
   const postBody = `_token=${encodeURIComponent(csrfToken)}&email=${encodeURIComponent(ALTEREGO_EMAIL)}&password=${encodeURIComponent(ALTEREGO_PASSWORD)}`;
 
   const step2 = await rawFetch(`${ALTEREGO_BASE}/login`, {
     method: "POST",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
-      "Cookie": `XSRF-TOKEN=${xsrfToken}; laravel_session=${laravelSession}`,
-      "User-Agent": "GAIA-AlterEgoXL/1.1"
+      "Cookie": cookieStr,
+      "User-Agent": "GAIA-AlterEgoXL/1.2"
     },
     body: postBody
   });
 
+  if (step2.status !== 302) {
+    return { cookie: "", ok: false, error: "Login POST non 302", status: step2.status };
+  }
+
+  // Merge cookies from step 2
   const cookies2 = extractCookies(step2.headers);
-  const finalSession = cookies2["laravel_session"] || laravelSession;
-  const finalXsrf = cookies2["XSRF-TOKEN"] || xsrfToken;
+  cookieStr = mergeCookieString(cookieStr, cookies2);
+
+  // Step 3: Follow redirect to /home to activate session
+  const location = step2.headers["location"] || `${ALTEREGO_BASE}/home`;
+  const step3 = await rawFetch(location, {
+    headers: {
+      "Cookie": cookieStr,
+      "User-Agent": "GAIA-AlterEgoXL/1.2"
+    }
+  });
+
+  // Merge cookies from step 3
+  const cookies3 = extractCookies(step3.headers);
+  cookieStr = mergeCookieString(cookieStr, cookies3);
 
   return {
-    cookie: `XSRF-TOKEN=${finalXsrf}; laravel_session=${finalSession}`,
-    ok: step2.status === 302,
+    cookie: cookieStr,
+    ok: true,
     status: step2.status,
-    location: step2.headers["location"] || ""
+    location: location,
+    step3_status: step3.status
   };
 }
 
@@ -119,12 +155,12 @@ async function loginAlterEgo() {
 
 async function authFetch(url) {
   const login = await loginAlterEgo();
-  if (!login.ok) throw new Error(`Login fallito (status ${login.status})`);
+  if (!login.ok) throw new Error(`Login fallito: ${login.error || "status " + login.status}`);
 
   const resp = await rawFetch(url, {
     headers: {
       "Cookie": login.cookie,
-      "User-Agent": "GAIA-AlterEgoXL/1.1",
+      "User-Agent": "GAIA-AlterEgoXL/1.2",
       "Accept": "application/json"
     }
   });
@@ -272,14 +308,14 @@ async function leggiImpianto() {
 
 async function scriviProprieta(propId, valore) {
   const login = await loginAlterEgo();
-  if (!login.ok) return { success: false, error: `Login fallito (status ${login.status})` };
+  if (!login.ok) return { success: false, error: `Login fallito: ${login.error}` };
 
   const url = `${ALTEREGO_BASE}/${STATION_ID}/putmprop?statid=${STATION_ID}&userid=guest&pcount=1&p0=${encodeURIComponent(propId)}&nb0=${encodeURIComponent(valore)}`;
 
   const resp = await rawFetch(url, {
     headers: {
       "Cookie": login.cookie,
-      "User-Agent": "GAIA-AlterEgoXL/1.1",
+      "User-Agent": "GAIA-AlterEgoXL/1.2",
       "Accept": "application/json"
     }
   });
@@ -390,7 +426,6 @@ async function handleToolCall(params) {
 // ROUTES
 // ============================================================
 
-// CORS
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
@@ -400,7 +435,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Health
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
@@ -410,7 +444,6 @@ app.get("/health", (req, res) => {
   });
 });
 
-// Debug login
 app.get("/debug-login", async (req, res) => {
   try {
     const result = await loginAlterEgo();
@@ -418,7 +451,8 @@ app.get("/debug-login", async (req, res) => {
       ok: result.ok,
       status: result.status,
       location: result.location,
-      hasCookie: !!result.cookie,
+      step3_status: result.step3_status,
+      cookieLength: result.cookie ? result.cookie.length : 0,
       hasEmail: !!ALTEREGO_EMAIL,
       hasPassword: !!ALTEREGO_PASSWORD
     });
@@ -427,7 +461,23 @@ app.get("/debug-login", async (req, res) => {
   }
 });
 
-// SSE endpoint
+app.get("/debug-getres", async (req, res) => {
+  try {
+    const data = await authFetch(`${ALTEREGO_BASE}/${STATION_ID}/getres?timestamp=`);
+    const preview = {};
+    if (data.Data && Array.isArray(data.Data)) {
+      preview.rowCount = data.Data.length;
+      preview.first5 = data.Data.slice(0, 5);
+      preview.timestamp = data.Timestamp;
+    } else {
+      preview.raw = data;
+    }
+    res.json(preview);
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+
 app.get("/sse", (req, res) => {
   const sessionId = require("crypto").randomUUID();
   const protocol = req.headers["x-forwarded-proto"] || req.protocol;
@@ -451,7 +501,6 @@ app.get("/sse", (req, res) => {
   });
 });
 
-// MCP JSON-RPC handler (POST to /message, /mcp, or /)
 async function handlePost(req, res) {
   try {
     const { method, params, id } = req.body;
