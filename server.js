@@ -237,7 +237,7 @@ function formatZoneMode(bv) {
 // ============================================================
 
 async function leggiImpianto() {
-  const data = await authFetch(`${ALTEREGO_BASE}/${STATION_ID}/getres?timestamp=`);
+  const data = await authFetch(`${ALTEREGO_BASE}/station/${STATION_ID}/getres?timestamp=`);
 
   if (!data.Data) {
     return { success: false, error: "Nessun dato ricevuto", raw: data };
@@ -328,7 +328,7 @@ async function leggiImpianto() {
 // ============================================================
 
 async function scriviProprieta(propId, valore) {
-  const url = `${ALTEREGO_BASE}/${STATION_ID}/putmprop?statid=${STATION_ID}&userid=guest&pcount=1&p0=${encodeURIComponent(propId)}&nb0=${encodeURIComponent(valore)}`;
+  const url = `${ALTEREGO_BASE}/station/${STATION_ID}/putmprop?statid=${STATION_ID}&userid=guest&pcount=1&p0=${encodeURIComponent(propId)}&nb0=${encodeURIComponent(valore)}`;
   const resp = await authWrite(url);
 
   return {
