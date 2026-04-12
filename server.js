@@ -412,7 +412,7 @@ async function handleToolCall(params) {
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id, MCP-Protocol-Version");
   res.header("Access-Control-Expose-Headers", "Mcp-Session-Id");
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
