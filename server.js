@@ -1,5 +1,10 @@
-// GAIA ALTEREGOXL MCP Server v1.2.1
+// GAIA ALTEREGOXL MCP Server v1.3.0
 // Node.js per Render.com
+//
+// CHANGELOG v1.3.0:
+// AE-01 — Mapping zone con raggruppamento per appartamento in leggi_impianto
+// AE-02 — Fix prop_id nella descrizione tool scrivi_proprieta
+// AE-03 — Fix path debug-getres (mancava /station/)
 
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
@@ -11,11 +16,42 @@ const { URL } = require("url");
 const app = express();
 app.use(express.json());
 
-const WORKER_VERSION = "1.2.1";
+const WORKER_VERSION = "1.3.0";
 const STATION_ID = "DOT_OHIILHBG";
 const ALTEREGO_BASE = "https://areariservata.alteregoxl.it";
 const ALTEREGO_EMAIL = process.env.ALTEREGO_EMAIL || "";
 const ALTEREGO_PASSWORD = process.env.ALTEREGO_PASSWORD || "";
+
+// ============================================================
+// ZONE MAPPING — AE-01
+// ============================================================
+
+const ZONE_MAP = {
+  1:  { nome: "Taverna",     appartamento: "Interrato" },
+  2:  { nome: "Soggiorno",   appartamento: "App. Piano Terra Sx" },
+  3:  { nome: "Camera",      appartamento: "App. Piano Terra Sx" },
+  4:  { nome: "Bagno",       appartamento: "App. Piano Terra Sx" },
+  5:  { nome: "Soggiorno",   appartamento: "App. Piano Terra Dx" },
+  6:  { nome: "Studio",      appartamento: "App. Piano Terra Dx" },
+  7:  { nome: "Camera",      appartamento: "App. Piano Terra Dx" },
+  8:  { nome: "Bagno",       appartamento: "App. Piano Terra Dx" },
+  9:  { nome: "Soggiorno",   appartamento: "Piano Primo" },
+  10: { nome: "Corridoio",   appartamento: "Piano Primo" },
+  12: { nome: "Camera",      appartamento: "Piano Primo" },
+  13: { nome: "Bagno",       appartamento: "Piano Primo" },
+  14: { nome: "Corridoio 2", appartamento: "Piano Primo" },
+  16: { nome: "Soggiorno",   appartamento: "Mansarda" },
+  17: { nome: "Camera",      appartamento: "Mansarda" },
+  18: { nome: "Bagno",       appartamento: "Mansarda" },
+};
+
+const APPARTAMENTO_ORDER = [
+  "Interrato",
+  "App. Piano Terra Sx",
+  "App. Piano Terra Dx",
+  "Piano Primo",
+  "Mansarda"
+];
 
 // ============================================================
 // HTTP HELPER
@@ -233,7 +269,7 @@ function formatZoneMode(bv) {
 }
 
 // ============================================================
-// TOOL: leggi_impianto
+// TOOL: leggi_impianto — AE-01
 // ============================================================
 
 async function leggiImpianto() {
@@ -248,25 +284,18 @@ async function leggiImpianto() {
     props[item.Id] = item.V;
   }
 
-  const result = {
-    impianto: {
-      stato: props.GLOBAL_ENABLE !== undefined ? formatBool(props.GLOBAL_ENABLE) : "N/D",
-      stagione: props.GLOBAL_SEASON !== undefined ? formatSeason(props.GLOBAL_SEASON) : "N/D",
-      acs_stato: props.GLOBAL_ACS_ENABLE !== undefined ? formatBool(props.GLOBAL_ACS_ENABLE) : "N/D",
-      temp_esterna: props.GLOBAL_T_EXT !== undefined ? formatD10(props.GLOBAL_T_EXT) + " °C" : "N/D",
-      temp_acs: props.GLOBAL_T_ACS !== undefined ? formatD10(props.GLOBAL_T_ACS) + " °C" : "N/D",
-    },
-    zone: [],
-    circuiti: [],
-    allarmi_attivi: []
-  };
-
+  // Raccolta zone — array intermedio
+  const zoneFlat = [];
   for (let i = 1; i <= 24; i++) {
     const xref = props[`Z${i}_ZONE_XREF`];
     if (xref === undefined || Number(xref) === 0) continue;
 
+    const mapping = ZONE_MAP[i] || { nome: `Zona ${i}`, appartamento: "Sconosciuto" };
+
     const zone = {
       numero: i,
+      nome: mapping.nome,
+      appartamento: mapping.appartamento,
       modo: props[`Z${i}_ZONE_MODE`] !== undefined ? formatZoneMode(props[`Z${i}_ZONE_MODE`]) : "N/D",
       uscita: props[`Z${i}_OUTPUT`] !== undefined ? formatBool(props[`Z${i}_OUTPUT`]) : "N/D",
       forzatura: props[`Z${i}_FORCING`] !== undefined ? formatForcing(props[`Z${i}_FORCING`]) : "N/D",
@@ -288,9 +317,28 @@ async function leggiImpianto() {
       zone.set_comfort_est = formatD10(props[`Z${i}_SET_CS`]) + " °C";
     }
 
-    result.zone.push(zone);
+    zoneFlat.push(zone);
   }
 
+  // Raggruppamento per appartamento — ordine canonico
+  const appartamenti = {};
+  for (const apt of APPARTAMENTO_ORDER) {
+    const zoneApt = zoneFlat.filter(z => z.appartamento === apt);
+    if (zoneApt.length === 0) continue;
+    appartamenti[apt] = {
+      zone: zoneApt.map(({ appartamento, ...rest }) => rest) // rimuove campo ridondante
+    };
+  }
+  // Appartamenti non in APPARTAMENTO_ORDER (fallback)
+  for (const z of zoneFlat) {
+    if (!appartamenti[z.appartamento]) {
+      appartamenti[z.appartamento] = { zone: [] };
+      appartamenti[z.appartamento].zone.push((({ appartamento, ...rest }) => rest)(z));
+    }
+  }
+
+  // Circuiti
+  const circuiti = [];
   for (let i = 1; i <= 8; i++) {
     const xref = props[`C${i}_XREF`];
     if (xref === undefined || Number(xref) === 0) continue;
@@ -303,24 +351,39 @@ async function leggiImpianto() {
     if (props[`C${i}_RET_TEMP`] !== undefined && Number(props[`C${i}_RET_TEMP`]) !== 32768) {
       circ.temp_ritorno = formatD10(props[`C${i}_RET_TEMP`]) + " °C";
     }
-    result.circuiti.push(circ);
+    circuiti.push(circ);
   }
 
+  // Allarmi
+  const allarmi_attivi = [];
   for (let a = 0; a <= 9; a++) {
     const key = `ALARM_${a}`;
     const val = Number(props[key] || 0);
     if (val === 0) continue;
     for (let b = 0; b < 8; b++) {
       if (val & (1 << b)) {
-        result.allarmi_attivi.push(`${key} bit ${b}`);
+        allarmi_attivi.push(`${key} bit ${b}`);
       }
     }
   }
 
-  result.timestamp = data.Timestamp || null;
-  result.ultimo_aggiornamento = data.Latest || null;
-
-  return { success: true, data: result };
+  return {
+    success: true,
+    data: {
+      impianto: {
+        stato: props.GLOBAL_ENABLE !== undefined ? formatBool(props.GLOBAL_ENABLE) : "N/D",
+        stagione: props.GLOBAL_SEASON !== undefined ? formatSeason(props.GLOBAL_SEASON) : "N/D",
+        acs_stato: props.GLOBAL_ACS_ENABLE !== undefined ? formatBool(props.GLOBAL_ACS_ENABLE) : "N/D",
+        temp_esterna: props.GLOBAL_T_EXT !== undefined ? formatD10(props.GLOBAL_T_EXT) + " °C" : "N/D",
+        temp_acs: props.GLOBAL_T_ACS !== undefined ? formatD10(props.GLOBAL_T_ACS) + " °C" : "N/D",
+      },
+      appartamenti,
+      circuiti,
+      allarmi_attivi,
+      timestamp: data.Timestamp || null,
+      ultimo_aggiornamento: data.Latest || null,
+    }
+  };
 }
 
 // ============================================================
@@ -347,12 +410,12 @@ async function scriviProprieta(propId, valore) {
 const TOOLS = [
   {
     name: "leggi_impianto",
-    description: "Legge tutti i dati live dell'impianto Cappellotto AlterEgo di Via Borgazzi 12: stato impianto, stagione, ACS, temperature zone, setpoint, umidità, circuiti, allarmi.",
+    description: "Legge tutti i dati live dell'impianto Cappellotto AlterEgo di Via Borgazzi 12: stato impianto, stagione, ACS, temperature zone (raggruppate per appartamento), setpoint, umidità, circuiti, allarmi.",
     inputSchema: { type: "object", properties: {}, required: [] }
   },
   {
     name: "scrivi_proprieta",
-    description: "Scrive una proprietà sull'impianto Cappellotto. Proprietà comuni: P_GLOBAL_ENABLE (0/1), P_GLOBAL_SEASON (0=inverno/1=estate), P_GLOBAL_ENABLE_ACS (0/1), Z{n}_FORCING (0=auto/1=off/3=comfort), Z{n}_SET_CW (setpoint comfort invernale D10), Z{n}_SET_CS (setpoint comfort estivo D10).",
+    description: "Scrive una proprietà sull'impianto Cappellotto. Proprietà comuni: GLOBAL_ENABLE (0/1), GLOBAL_SEASON (0=inverno/1=estate), GLOBAL_ACS_ENABLE (0/1), Z{n}_FORCING (0=auto/1=off/3=comfort), Z{n}_SET_CW (setpoint comfort invernale D10), Z{n}_SET_CS (setpoint comfort estivo D10).",
     inputSchema: {
       type: "object",
       properties: {
@@ -431,7 +494,8 @@ app.get("/debug-login", async (req, res) => {
 
 app.get("/debug-getres", async (req, res) => {
   try {
-    const data = await authFetch(`${ALTEREGO_BASE}/${STATION_ID}/getres?timestamp=`);
+    // AE-03: fix path — aggiunto /station/
+    const data = await authFetch(`${ALTEREGO_BASE}/station/${STATION_ID}/getres?timestamp=`);
     if (data.Data && Array.isArray(data.Data)) {
       res.json({ rowCount: data.Data.length, first5: data.Data.slice(0, 5), timestamp: data.Timestamp });
     } else {
