@@ -1,5 +1,9 @@
-// GAIA ALTEREGOXL MCP Server v1.3.0
+// GAIA ALTEREGOXL MCP Server v1.4.0
 // Node.js per Render.com
+//
+// CHANGELOG v1.4.0:
+// AE-04 — set_setpoint_zona: imposta temperatura comfort zona (inverno/estate)
+// AE-05 — set_forzatura_zona: spegne/accende/forza zona (auto/off/comfort/economy)
 //
 // CHANGELOG v1.3.0:
 // AE-01 — Mapping zone con raggruppamento per appartamento in leggi_impianto
@@ -16,14 +20,14 @@ const { URL } = require("url");
 const app = express();
 app.use(express.json());
 
-const WORKER_VERSION = "1.3.0";
+const WORKER_VERSION = "1.4.0";
 const STATION_ID = "DOT_OHIILHBG";
 const ALTEREGO_BASE = "https://areariservata.alteregoxl.it";
 const ALTEREGO_EMAIL = process.env.ALTEREGO_EMAIL || "";
 const ALTEREGO_PASSWORD = process.env.ALTEREGO_PASSWORD || "";
 
 // ============================================================
-// ZONE MAPPING — AE-01
+// ZONE MAPPING
 // ============================================================
 
 const ZONE_MAP = {
@@ -125,7 +129,6 @@ function getXsrfFromCookieStr(cookieStr) {
 // ============================================================
 
 async function loginAlterEgo() {
-  // Step 1: GET /login
   const step1 = await rawFetch(`${ALTEREGO_BASE}/login`, {
     headers: { "User-Agent": "GAIA-AlterEgoXL/1.2" }
   });
@@ -141,7 +144,6 @@ async function loginAlterEgo() {
   const csrfToken = decodeURIComponent(xsrfToken);
   let cookieStr = `XSRF-TOKEN=${xsrfToken}; laravel_session=${laravelSession}`;
 
-  // Step 2: POST /login
   const step2 = await rawFetch(`${ALTEREGO_BASE}/login`, {
     method: "POST",
     headers: {
@@ -159,7 +161,6 @@ async function loginAlterEgo() {
   const cookies2 = extractCookies(step2.headers);
   cookieStr = mergeCookieString(cookieStr, cookies2);
 
-  // Step 3: Follow redirect to /home
   const location = step2.headers["location"] || `${ALTEREGO_BASE}/home`;
   const step3 = await rawFetch(location, {
     headers: {
@@ -269,7 +270,7 @@ function formatZoneMode(bv) {
 }
 
 // ============================================================
-// TOOL: leggi_impianto — AE-01
+// TOOL: leggi_impianto
 // ============================================================
 
 async function leggiImpianto() {
@@ -284,7 +285,6 @@ async function leggiImpianto() {
     props[item.Id] = item.V;
   }
 
-  // Raccolta zone — array intermedio
   const zoneFlat = [];
   for (let i = 1; i <= 24; i++) {
     const xref = props[`Z${i}_ZONE_XREF`];
@@ -320,16 +320,14 @@ async function leggiImpianto() {
     zoneFlat.push(zone);
   }
 
-  // Raggruppamento per appartamento — ordine canonico
   const appartamenti = {};
   for (const apt of APPARTAMENTO_ORDER) {
     const zoneApt = zoneFlat.filter(z => z.appartamento === apt);
     if (zoneApt.length === 0) continue;
     appartamenti[apt] = {
-      zone: zoneApt.map(({ appartamento, ...rest }) => rest) // rimuove campo ridondante
+      zone: zoneApt.map(({ appartamento, ...rest }) => rest)
     };
   }
-  // Appartamenti non in APPARTAMENTO_ORDER (fallback)
   for (const z of zoneFlat) {
     if (!appartamenti[z.appartamento]) {
       appartamenti[z.appartamento] = { zone: [] };
@@ -337,7 +335,6 @@ async function leggiImpianto() {
     }
   }
 
-  // Circuiti
   const circuiti = [];
   for (let i = 1; i <= 8; i++) {
     const xref = props[`C${i}_XREF`];
@@ -354,7 +351,6 @@ async function leggiImpianto() {
     circuiti.push(circ);
   }
 
-  // Allarmi
   const allarmi_attivi = [];
   for (let a = 0; a <= 9; a++) {
     const key = `ALARM_${a}`;
@@ -387,19 +383,99 @@ async function leggiImpianto() {
 }
 
 // ============================================================
-// TOOL: scrivi_proprieta
+// TOOL: scrivi_proprieta (generico — emergenza)
 // ============================================================
 
 async function scriviProprieta(propId, valore) {
   const url = `${ALTEREGO_BASE}/station/${STATION_ID}/putmprop?statid=${STATION_ID}&userid=guest&pcount=1&p0=${encodeURIComponent(propId)}&nb0=${encodeURIComponent(valore)}`;
   const resp = await authWrite(url);
-
   return {
     success: resp.status === 200,
     propId,
     valore,
     status: resp.status,
     response: resp.json || resp.body
+  };
+}
+
+// ============================================================
+// TOOL: set_setpoint_zona — AE-04
+// ============================================================
+
+async function setSetpointZona(zona, temperatura, stagione) {
+  const zonaNum = Number(zona);
+  const mapping = ZONE_MAP[zonaNum];
+
+  if (!mapping) {
+    return { success: false, error: `Zona ${zonaNum} non presente nel mapping.` };
+  }
+  if (isNaN(temperatura) || temperatura < 5 || temperatura > 35) {
+    return { success: false, error: `Temperatura non valida: ${temperatura}. Range consentito: 5–35 °C.` };
+  }
+
+  const stagNorm = (stagione || "inverno").toLowerCase();
+  if (stagNorm !== "inverno" && stagNorm !== "estate") {
+    return { success: false, error: `Stagione non valida: "${stagione}". Usare "inverno" o "estate".` };
+  }
+
+  const propId = stagNorm === "inverno" ? `Z${zonaNum}_SET_CW` : `Z${zonaNum}_SET_CS`;
+  const valoreD10 = Math.round(temperatura * 10);
+
+  const resp = await scriviProprieta(propId, valoreD10);
+
+  return {
+    success: resp.success,
+    zona: zonaNum,
+    nome: mapping.nome,
+    appartamento: mapping.appartamento,
+    stagione: stagNorm,
+    temperatura_impostata: `${temperatura} °C`,
+    prop_id: propId,
+    valore_d10: valoreD10,
+    status: resp.status,
+    response: resp.response
+  };
+}
+
+// ============================================================
+// TOOL: set_forzatura_zona — AE-05
+// ============================================================
+
+async function setForzaturaZona(zona, modo) {
+  const zonaNum = Number(zona);
+  const mapping = ZONE_MAP[zonaNum];
+
+  if (!mapping) {
+    return { success: false, error: `Zona ${zonaNum} non presente nel mapping.` };
+  }
+
+  const FORZATURA_MAP = {
+    auto:    0,
+    off:     1,
+    economy: 2,
+    comfort: 3
+  };
+
+  const modoNorm = (modo || "").toLowerCase();
+  if (!(modoNorm in FORZATURA_MAP)) {
+    return { success: false, error: `Modo non valido: "${modo}". Valori ammessi: auto, off, economy, comfort.` };
+  }
+
+  const propId = `Z${zonaNum}_FORCING`;
+  const valore = FORZATURA_MAP[modoNorm];
+
+  const resp = await scriviProprieta(propId, valore);
+
+  return {
+    success: resp.success,
+    zona: zonaNum,
+    nome: mapping.nome,
+    appartamento: mapping.appartamento,
+    modo_impostato: modoNorm,
+    prop_id: propId,
+    valore: valore,
+    status: resp.status,
+    response: resp.response
   };
 }
 
@@ -414,13 +490,38 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {}, required: [] }
   },
   {
+    name: "set_setpoint_zona",
+    description: "Imposta la temperatura di comfort di una zona. Specificare il numero zona (ricavabile da leggi_impianto), la temperatura in °C (range 5–35) e la stagione (inverno o estate, default inverno). Converte automaticamente in formato D10.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        zona:        { type: "number", description: "Numero zona (es. 12 per Camera Piano Primo)" },
+        temperatura: { type: "number", description: "Temperatura di comfort in °C (es. 21.5). Range: 5–35." },
+        stagione:    { type: "string", description: "Stagione: 'inverno' (default) o 'estate'." }
+      },
+      required: ["zona", "temperatura"]
+    }
+  },
+  {
+    name: "set_forzatura_zona",
+    description: "Imposta la modalità di forzatura di una zona. Specificare il numero zona e il modo desiderato: 'auto' (segue programma), 'off' (zona spenta), 'comfort' (forza comfort), 'economy' (forza economy).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        zona: { type: "number", description: "Numero zona (es. 12 per Camera Piano Primo)" },
+        modo: { type: "string", description: "Modalità: 'auto', 'off', 'comfort', 'economy'" }
+      },
+      required: ["zona", "modo"]
+    }
+  },
+  {
     name: "scrivi_proprieta",
-    description: "Scrive una proprietà sull'impianto Cappellotto. Proprietà comuni: GLOBAL_ENABLE (0/1), GLOBAL_SEASON (0=inverno/1=estate), GLOBAL_ACS_ENABLE (0/1), Z{n}_FORCING (0=auto/1=off/3=comfort), Z{n}_SET_CW (setpoint comfort invernale D10), Z{n}_SET_CS (setpoint comfort estivo D10).",
+    description: "Tool generico — usa solo per proprietà non coperte dai tool semantici. Proprietà comuni: GLOBAL_ENABLE (0/1), GLOBAL_SEASON (0=inverno/1=estate), GLOBAL_ACS_ENABLE (0/1), Z{n}_FORCING (0=auto/1=off/2=economy/3=comfort), Z{n}_SET_CW (setpoint comfort invernale D10), Z{n}_SET_CS (setpoint comfort estivo D10).",
     inputSchema: {
       type: "object",
       properties: {
         prop_id: { type: "string", description: "ID della proprietà da scrivere" },
-        valore: { type: "number", description: "Valore numerico. Temperature: x10 (21.5°C=215). Booleani: 0/1." }
+        valore:  { type: "number", description: "Valore numerico. Temperature: x10 (21.5°C=215). Booleani: 0/1." }
       },
       required: ["prop_id", "valore"]
     }
@@ -455,8 +556,19 @@ async function handleToolCall(params) {
       case "leggi_impianto":
         result = await leggiImpianto();
         break;
+      case "set_setpoint_zona":
+        if (args?.zona === undefined || args?.temperatura === undefined)
+          throw new Error("Parametri obbligatori: zona, temperatura");
+        result = await setSetpointZona(args.zona, args.temperatura, args.stagione);
+        break;
+      case "set_forzatura_zona":
+        if (args?.zona === undefined || !args?.modo)
+          throw new Error("Parametri obbligatori: zona, modo");
+        result = await setForzaturaZona(args.zona, args.modo);
+        break;
       case "scrivi_proprieta":
-        if (!args?.prop_id || args?.valore === undefined) throw new Error("Parametri obbligatori: prop_id, valore");
+        if (!args?.prop_id || args?.valore === undefined)
+          throw new Error("Parametri obbligatori: prop_id, valore");
         result = await scriviProprieta(args.prop_id, args.valore);
         break;
       default:
@@ -494,7 +606,6 @@ app.get("/debug-login", async (req, res) => {
 
 app.get("/debug-getres", async (req, res) => {
   try {
-    // AE-03: fix path — aggiunto /station/
     const data = await authFetch(`${ALTEREGO_BASE}/station/${STATION_ID}/getres?timestamp=`);
     if (data.Data && Array.isArray(data.Data)) {
       res.json({ rowCount: data.Data.length, first5: data.Data.slice(0, 5), timestamp: data.Timestamp });
