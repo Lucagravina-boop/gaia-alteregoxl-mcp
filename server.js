@@ -1,14 +1,24 @@
-// GAIA ALTEREGOXL MCP Server v1.4.0
+// GAIA ALTEREGOXL MCP Server v1.5.0
 // Node.js per Render.com
 //
+// CHANGELOG v1.5.0:
+// AE-06 — set_impianto: accende/spegne l'intero impianto
+// AE-07 — set_stagione: cambia stagione inverno/estate
+// AE-08 — set_appartamento: forzatura su tutte le zone di un appartamento (login singolo)
+// AE-09 — set_tutto_off: spegne tutte le zone (login singolo)
+// AE-10 — set_tutto_auto: riporta tutte le zone in automatico (login singolo)
+// AE-11 — leggi_appartamento: snapshot di un singolo appartamento
+// AE-12 — leggi_allarmi: solo sezione allarmi
+// AE-13 — check_anomalie: diagnostica automatica su dati live
+//
 // CHANGELOG v1.4.0:
-// AE-04 — set_setpoint_zona: imposta temperatura comfort zona (inverno/estate)
-// AE-05 — set_forzatura_zona: spegne/accende/forza zona (auto/off/comfort/economy)
+// AE-04 — set_setpoint_zona
+// AE-05 — set_forzatura_zona
 //
 // CHANGELOG v1.3.0:
-// AE-01 — Mapping zone con raggruppamento per appartamento in leggi_impianto
-// AE-02 — Fix prop_id nella descrizione tool scrivi_proprieta
-// AE-03 — Fix path debug-getres (mancava /station/)
+// AE-01 — mapping zone + raggruppamento appartamenti
+// AE-02 — fix prop_id descrizione scrivi_proprieta
+// AE-03 — fix path debug-getres
 
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
@@ -20,7 +30,7 @@ const { URL } = require("url");
 const app = express();
 app.use(express.json());
 
-const WORKER_VERSION = "1.4.0";
+const WORKER_VERSION = "1.5.0";
 const STATION_ID = "DOT_OHIILHBG";
 const ALTEREGO_BASE = "https://areariservata.alteregoxl.it";
 const ALTEREGO_EMAIL = process.env.ALTEREGO_EMAIL || "";
@@ -57,6 +67,8 @@ const APPARTAMENTO_ORDER = [
   "Mansarda"
 ];
 
+const FORZATURA_MAP = { auto: 0, off: 1, economy: 2, comfort: 3 };
+
 // ============================================================
 // HTTP HELPER
 // ============================================================
@@ -73,15 +85,11 @@ function rawFetch(urlStr, options = {}) {
       headers: options.headers || {},
       rejectUnauthorized: false
     };
-
     const req = mod.request(reqOpts, (res) => {
       let body = "";
       res.on("data", (chunk) => { body += chunk; });
-      res.on("end", () => {
-        resolve({ status: res.statusCode, headers: res.headers, body });
-      });
+      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body }));
     });
-
     req.on("error", reject);
     if (options.body) req.write(options.body);
     req.end();
@@ -112,16 +120,13 @@ function mergeCookieString(existing, newCookies) {
       if (eq > 0) map[part.substring(0, eq)] = part.substring(eq + 1);
     }
   }
-  for (const [k, v] of Object.entries(newCookies)) {
-    map[k] = v;
-  }
+  for (const [k, v] of Object.entries(newCookies)) map[k] = v;
   return Object.entries(map).map(([k, v]) => `${k}=${v}`).join("; ");
 }
 
 function getXsrfFromCookieStr(cookieStr) {
   const match = cookieStr.match(/XSRF-TOKEN=([^;]+)/);
-  if (match) return decodeURIComponent(match[1]);
-  return "";
+  return match ? decodeURIComponent(match[1]) : "";
 }
 
 // ============================================================
@@ -130,7 +135,7 @@ function getXsrfFromCookieStr(cookieStr) {
 
 async function loginAlterEgo() {
   const step1 = await rawFetch(`${ALTEREGO_BASE}/login`, {
-    headers: { "User-Agent": "GAIA-AlterEgoXL/1.2" }
+    headers: { "User-Agent": "GAIA-AlterEgoXL/1.5" }
   });
 
   const cookies1 = extractCookies(step1.headers);
@@ -149,7 +154,7 @@ async function loginAlterEgo() {
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
       "Cookie": cookieStr,
-      "User-Agent": "GAIA-AlterEgoXL/1.2"
+      "User-Agent": "GAIA-AlterEgoXL/1.5"
     },
     body: `_token=${encodeURIComponent(csrfToken)}&email=${encodeURIComponent(ALTEREGO_EMAIL)}&password=${encodeURIComponent(ALTEREGO_PASSWORD)}`
   });
@@ -165,7 +170,7 @@ async function loginAlterEgo() {
   const step3 = await rawFetch(location, {
     headers: {
       "Cookie": cookieStr,
-      "User-Agent": "GAIA-AlterEgoXL/1.2",
+      "User-Agent": "GAIA-AlterEgoXL/1.5",
       "X-Requested-With": "XMLHttpRequest"
     }
   });
@@ -178,7 +183,7 @@ async function loginAlterEgo() {
     xsrfDecoded: getXsrfFromCookieStr(cookieStr),
     ok: true,
     status: step2.status,
-    location: location,
+    location,
     step3_status: step3.status
   };
 }
@@ -194,32 +199,33 @@ async function authFetch(url) {
   const resp = await rawFetch(url, {
     headers: {
       "Cookie": login.cookie,
-      "User-Agent": "GAIA-AlterEgoXL/1.2",
+      "User-Agent": "GAIA-AlterEgoXL/1.5",
       "Accept": "application/json, text/javascript, */*; q=0.01",
       "X-Requested-With": "XMLHttpRequest",
       "X-XSRF-TOKEN": login.xsrfDecoded
     }
   });
 
-  try {
-    return JSON.parse(resp.body);
-  } catch {
-    return { raw: resp.body.substring(0, 500), status: resp.status };
-  }
+  try { return JSON.parse(resp.body); }
+  catch { return { raw: resp.body.substring(0, 500), status: resp.status }; }
 }
 
 // ============================================================
-// AUTHENTICATED WRITE
+// AUTHENTICATED WRITE — singola proprietà
 // ============================================================
 
 async function authWrite(url) {
   const login = await loginAlterEgo();
   if (!login.ok) return { success: false, error: `Login fallito: ${login.error}` };
+  return authWriteWithSession(url, login);
+}
 
+// Write con sessione già aperta (per operazioni multi-zona)
+async function authWriteWithSession(url, login) {
   const resp = await rawFetch(url, {
     headers: {
       "Cookie": login.cookie,
-      "User-Agent": "GAIA-AlterEgoXL/1.2",
+      "User-Agent": "GAIA-AlterEgoXL/1.5",
       "Accept": "application/json, text/javascript, */*; q=0.01",
       "X-Requested-With": "XMLHttpRequest",
       "X-XSRF-TOKEN": login.xsrfDecoded
@@ -229,6 +235,30 @@ async function authWrite(url) {
   let json;
   try { json = JSON.parse(resp.body); } catch { json = null; }
   return { status: resp.status, json, body: resp.body.substring(0, 300) };
+}
+
+// Write multiplo — login singolo, N scritture sequenziali
+async function authWriteMulti(propValuePairs) {
+  const login = await loginAlterEgo();
+  if (!login.ok) return { ok: false, error: `Login fallito: ${login.error}`, results: [] };
+
+  const results = [];
+  for (const { propId, valore } of propValuePairs) {
+    const url = buildWriteUrl(propId, valore);
+    const resp = await authWriteWithSession(url, login);
+    results.push({
+      propId,
+      valore,
+      success: resp.status === 200,
+      status: resp.status,
+      response: resp.json || resp.body
+    });
+  }
+  return { ok: true, results };
+}
+
+function buildWriteUrl(propId, valore) {
+  return `${ALTEREGO_BASE}/station/${STATION_ID}/putmprop?statid=${STATION_ID}&userid=guest&pcount=1&p0=${encodeURIComponent(propId)}&nb0=${encodeURIComponent(valore)}`;
 }
 
 // ============================================================
@@ -243,6 +273,14 @@ function formatD10(bv) {
   let val = v;
   if (val >= 32768) val -= 65536;
   return (val / 10).toFixed(1);
+}
+
+function formatD10Raw(bv) {
+  const v = Number(bv);
+  if (v === 32768 || v === 32769 || v < 0) return null;
+  let val = v;
+  if (val >= 32768) val -= 65536;
+  return val / 10;
 }
 
 function formatBool(bv) { return Number(bv) === 0 ? "OFF" : "ON"; }
@@ -270,28 +308,26 @@ function formatZoneMode(bv) {
 }
 
 // ============================================================
-// TOOL: leggi_impianto
+// CORE: leggi dati grezzi impianto
 // ============================================================
 
-async function leggiImpianto() {
+async function fetchImpianto() {
   const data = await authFetch(`${ALTEREGO_BASE}/station/${STATION_ID}/getres?timestamp=`);
-
-  if (!data.Data) {
-    return { success: false, error: "Nessun dato ricevuto", raw: data };
-  }
+  if (!data.Data) throw new Error("Nessun dato ricevuto dall'impianto");
 
   const props = {};
-  for (const item of data.Data) {
-    props[item.Id] = item.V;
-  }
+  for (const item of data.Data) props[item.Id] = item.V;
 
+  return { props, timestamp: data.Timestamp, latest: data.Latest };
+}
+
+function buildZoneFlat(props) {
   const zoneFlat = [];
   for (let i = 1; i <= 24; i++) {
     const xref = props[`Z${i}_ZONE_XREF`];
     if (xref === undefined || Number(xref) === 0) continue;
 
     const mapping = ZONE_MAP[i] || { nome: `Zona ${i}`, appartamento: "Sconosciuto" };
-
     const zone = {
       numero: i,
       nome: mapping.nome,
@@ -301,32 +337,28 @@ async function leggiImpianto() {
       forzatura: props[`Z${i}_FORCING`] !== undefined ? formatForcing(props[`Z${i}_FORCING`]) : "N/D",
     };
 
-    if (props[`Z${i}_TEMP`] !== undefined && Number(props[`Z${i}_TEMP`]) !== 32768) {
+    if (props[`Z${i}_TEMP`] !== undefined && Number(props[`Z${i}_TEMP`]) !== 32768)
       zone.temperatura = formatD10(props[`Z${i}_TEMP`]) + " °C";
-    }
-    if (props[`Z${i}_ZONE_SET`] !== undefined) {
+    if (props[`Z${i}_ZONE_SET`] !== undefined)
       zone.setpoint = formatD10(props[`Z${i}_ZONE_SET`]) + " °C";
-    }
-    if (props[`Z${i}_RH`] !== undefined && Number(props[`Z${i}_RH`]) !== 32768) {
+    if (props[`Z${i}_RH`] !== undefined && Number(props[`Z${i}_RH`]) !== 32768)
       zone.umidita = formatD10(props[`Z${i}_RH`]) + " %";
-    }
-    if (props[`Z${i}_SET_CW`] !== undefined) {
+    if (props[`Z${i}_SET_CW`] !== undefined)
       zone.set_comfort_inv = formatD10(props[`Z${i}_SET_CW`]) + " °C";
-    }
-    if (props[`Z${i}_SET_CS`] !== undefined) {
+    if (props[`Z${i}_SET_CS`] !== undefined)
       zone.set_comfort_est = formatD10(props[`Z${i}_SET_CS`]) + " °C";
-    }
 
     zoneFlat.push(zone);
   }
+  return zoneFlat;
+}
 
+function buildAppartamenti(zoneFlat) {
   const appartamenti = {};
   for (const apt of APPARTAMENTO_ORDER) {
     const zoneApt = zoneFlat.filter(z => z.appartamento === apt);
     if (zoneApt.length === 0) continue;
-    appartamenti[apt] = {
-      zone: zoneApt.map(({ appartamento, ...rest }) => rest)
-    };
+    appartamenti[apt] = { zone: zoneApt.map(({ appartamento, ...rest }) => rest) };
   }
   for (const z of zoneFlat) {
     if (!appartamenti[z.appartamento]) {
@@ -334,52 +366,223 @@ async function leggiImpianto() {
       appartamenti[z.appartamento].zone.push((({ appartamento, ...rest }) => rest)(z));
     }
   }
+  return appartamenti;
+}
 
+function buildCircuiti(props) {
   const circuiti = [];
   for (let i = 1; i <= 8; i++) {
     const xref = props[`C${i}_XREF`];
     if (xref === undefined || Number(xref) === 0) continue;
-
     const circ = {
       numero: i,
       temp_mandata: props[`C${i}_TEMP`] !== undefined ? formatD10(props[`C${i}_TEMP`]) + " °C" : "N/D",
       setpoint: props[`C${i}_SET`] !== undefined ? formatD10(props[`C${i}_SET`]) + " °C" : "N/D",
     };
-    if (props[`C${i}_RET_TEMP`] !== undefined && Number(props[`C${i}_RET_TEMP`]) !== 32768) {
+    if (props[`C${i}_RET_TEMP`] !== undefined && Number(props[`C${i}_RET_TEMP`]) !== 32768)
       circ.temp_ritorno = formatD10(props[`C${i}_RET_TEMP`]) + " °C";
-    }
     circuiti.push(circ);
   }
+  return circuiti;
+}
 
-  const allarmi_attivi = [];
+function buildAllarmi(props) {
+  const allarmi = [];
   for (let a = 0; a <= 9; a++) {
     const key = `ALARM_${a}`;
     const val = Number(props[key] || 0);
     if (val === 0) continue;
     for (let b = 0; b < 8; b++) {
-      if (val & (1 << b)) {
-        allarmi_attivi.push(`${key} bit ${b}`);
-      }
+      if (val & (1 << b)) allarmi.push(`${key} bit ${b}`);
     }
   }
+  return allarmi;
+}
 
+function buildImpiantoHeader(props) {
   return {
-    success: true,
-    data: {
-      impianto: {
-        stato: props.GLOBAL_ENABLE !== undefined ? formatBool(props.GLOBAL_ENABLE) : "N/D",
-        stagione: props.GLOBAL_SEASON !== undefined ? formatSeason(props.GLOBAL_SEASON) : "N/D",
-        acs_stato: props.GLOBAL_ACS_ENABLE !== undefined ? formatBool(props.GLOBAL_ACS_ENABLE) : "N/D",
-        temp_esterna: props.GLOBAL_T_EXT !== undefined ? formatD10(props.GLOBAL_T_EXT) + " °C" : "N/D",
-        temp_acs: props.GLOBAL_T_ACS !== undefined ? formatD10(props.GLOBAL_T_ACS) + " °C" : "N/D",
-      },
-      appartamenti,
-      circuiti,
-      allarmi_attivi,
-      timestamp: data.Timestamp || null,
-      ultimo_aggiornamento: data.Latest || null,
-    }
+    stato: props.GLOBAL_ENABLE !== undefined ? formatBool(props.GLOBAL_ENABLE) : "N/D",
+    stagione: props.GLOBAL_SEASON !== undefined ? formatSeason(props.GLOBAL_SEASON) : "N/D",
+    acs_stato: props.GLOBAL_ACS_ENABLE !== undefined ? formatBool(props.GLOBAL_ACS_ENABLE) : "N/D",
+    temp_esterna: props.GLOBAL_T_EXT !== undefined ? formatD10(props.GLOBAL_T_EXT) + " °C" : "N/D",
+    temp_acs: props.GLOBAL_T_ACS !== undefined ? formatD10(props.GLOBAL_T_ACS) + " °C" : "N/D",
   };
+}
+
+// ============================================================
+// TOOL: leggi_impianto
+// ============================================================
+
+async function leggiImpianto() {
+  try {
+    const { props, timestamp, latest } = await fetchImpianto();
+    const zoneFlat = buildZoneFlat(props);
+    return {
+      success: true,
+      data: {
+        impianto: buildImpiantoHeader(props),
+        appartamenti: buildAppartamenti(zoneFlat),
+        circuiti: buildCircuiti(props),
+        allarmi_attivi: buildAllarmi(props),
+        timestamp: timestamp || null,
+        ultimo_aggiornamento: latest || null,
+      }
+    };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+// ============================================================
+// TOOL: leggi_appartamento — AE-11
+// ============================================================
+
+async function leggiAppartamento(appartamento) {
+  const aptNorm = APPARTAMENTO_ORDER.find(
+    a => a.toLowerCase() === appartamento.toLowerCase()
+  );
+  if (!aptNorm) {
+    return {
+      success: false,
+      error: `Appartamento non trovato: "${appartamento}".`,
+      appartamenti_validi: APPARTAMENTO_ORDER
+    };
+  }
+
+  try {
+    const { props, timestamp, latest } = await fetchImpianto();
+    const zoneFlat = buildZoneFlat(props).filter(z => z.appartamento === aptNorm);
+
+    return {
+      success: true,
+      appartamento: aptNorm,
+      zone: zoneFlat.map(({ appartamento: _, ...rest }) => rest),
+      timestamp: timestamp || null,
+      ultimo_aggiornamento: latest || null,
+    };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+// ============================================================
+// TOOL: leggi_allarmi — AE-12
+// ============================================================
+
+async function leggiAllarmi() {
+  try {
+    const { props, timestamp, latest } = await fetchImpianto();
+    const allarmi = buildAllarmi(props);
+    return {
+      success: true,
+      allarmi_attivi: allarmi,
+      count: allarmi.length,
+      stato_impianto: props.GLOBAL_ENABLE !== undefined ? formatBool(props.GLOBAL_ENABLE) : "N/D",
+      timestamp: timestamp || null,
+      ultimo_aggiornamento: latest || null,
+    };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+// ============================================================
+// TOOL: check_anomalie — AE-13
+// ============================================================
+
+async function checkAnomalie() {
+  try {
+    const { props, timestamp, latest } = await fetchImpianto();
+    const zoneFlat = buildZoneFlat(props);
+    const anomalie = [];
+
+    // Allarmi attivi
+    const allarmi = buildAllarmi(props);
+    for (const a of allarmi) {
+      anomalie.push({ tipo: "ALLARME", zona: null, appartamento: null, dettaglio: a });
+    }
+
+    // Analisi per zona
+    for (const z of zoneFlat) {
+      const zonaLabel = `${z.nome} (${z.appartamento})`;
+
+      // Umidità alta — rischio muffa
+      const rh = props[`Z${z.numero}_RH`];
+      if (rh !== undefined) {
+        const rhVal = formatD10Raw(rh);
+        if (rhVal !== null && rhVal >= 70) {
+          anomalie.push({
+            tipo: "UMIDITÀ_ALTA",
+            zona: z.numero,
+            appartamento: z.appartamento,
+            dettaglio: `${zonaLabel}: umidità ${rhVal.toFixed(1)}% — rischio muffa`
+          });
+        }
+      }
+
+      // Temperatura bassa — rischio gelo
+      const temp = props[`Z${z.numero}_TEMP`];
+      if (temp !== undefined) {
+        const tempVal = formatD10Raw(temp);
+        if (tempVal !== null && tempVal < 8) {
+          anomalie.push({
+            tipo: "RISCHIO_GELO",
+            zona: z.numero,
+            appartamento: z.appartamento,
+            dettaglio: `${zonaLabel}: temperatura ${tempVal.toFixed(1)}°C — rischio gelo`
+          });
+        }
+      }
+
+      // Sensore temperatura N/C su zona non spenta
+      const forcing = Number(props[`Z${z.numero}_FORCING`] || 0);
+      const tempRaw = Number(props[`Z${z.numero}_TEMP`]);
+      const sensoreMancante = tempRaw === 32769; // N/C
+      if (sensoreMancante && forcing !== 1) {
+        anomalie.push({
+          tipo: "SENSORE_DISCONNESSO",
+          zona: z.numero,
+          appartamento: z.appartamento,
+          dettaglio: `${zonaLabel}: sensore temperatura N/C su zona attiva (forzatura: ${formatForcing(forcing)})`
+        });
+      }
+    }
+
+    // Delta temperatura tra zone dello stesso appartamento
+    for (const apt of APPARTAMENTO_ORDER) {
+      const zoneApt = zoneFlat.filter(z => z.appartamento === apt);
+      const tempsValide = zoneApt
+        .map(z => ({ nome: z.nome, val: formatD10Raw(props[`Z${z.numero}_TEMP`]) }))
+        .filter(t => t.val !== null);
+
+      if (tempsValide.length >= 2) {
+        const max = Math.max(...tempsValide.map(t => t.val));
+        const min = Math.min(...tempsValide.map(t => t.val));
+        if (max - min > 5) {
+          const nomeMax = tempsValide.find(t => t.val === max).nome;
+          const nomeMin = tempsValide.find(t => t.val === min).nome;
+          anomalie.push({
+            tipo: "DELTA_TEMPERATURA",
+            zona: null,
+            appartamento: apt,
+            dettaglio: `${apt}: delta ${(max - min).toFixed(1)}°C tra ${nomeMax} (${max.toFixed(1)}°C) e ${nomeMin} (${min.toFixed(1)}°C)`
+          });
+        }
+      }
+    }
+
+    return {
+      success: true,
+      anomalie_rilevate: anomalie.length,
+      anomalie,
+      stato_impianto: props.GLOBAL_ENABLE !== undefined ? formatBool(props.GLOBAL_ENABLE) : "N/D",
+      stagione: props.GLOBAL_SEASON !== undefined ? formatSeason(props.GLOBAL_SEASON) : "N/D",
+      timestamp: timestamp || null,
+      ultimo_aggiornamento: latest || null,
+    };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
 }
 
 // ============================================================
@@ -387,7 +590,7 @@ async function leggiImpianto() {
 // ============================================================
 
 async function scriviProprieta(propId, valore) {
-  const url = `${ALTEREGO_BASE}/station/${STATION_ID}/putmprop?statid=${STATION_ID}&userid=guest&pcount=1&p0=${encodeURIComponent(propId)}&nb0=${encodeURIComponent(valore)}`;
+  const url = buildWriteUrl(propId, valore);
   const resp = await authWrite(url);
   return {
     success: resp.status === 200,
@@ -405,22 +608,16 @@ async function scriviProprieta(propId, valore) {
 async function setSetpointZona(zona, temperatura, stagione) {
   const zonaNum = Number(zona);
   const mapping = ZONE_MAP[zonaNum];
-
-  if (!mapping) {
-    return { success: false, error: `Zona ${zonaNum} non presente nel mapping.` };
-  }
-  if (isNaN(temperatura) || temperatura < 5 || temperatura > 35) {
+  if (!mapping) return { success: false, error: `Zona ${zonaNum} non presente nel mapping.` };
+  if (isNaN(temperatura) || temperatura < 5 || temperatura > 35)
     return { success: false, error: `Temperatura non valida: ${temperatura}. Range consentito: 5–35 °C.` };
-  }
 
   const stagNorm = (stagione || "inverno").toLowerCase();
-  if (stagNorm !== "inverno" && stagNorm !== "estate") {
+  if (stagNorm !== "inverno" && stagNorm !== "estate")
     return { success: false, error: `Stagione non valida: "${stagione}". Usare "inverno" o "estate".` };
-  }
 
   const propId = stagNorm === "inverno" ? `Z${zonaNum}_SET_CW` : `Z${zonaNum}_SET_CS`;
   const valoreD10 = Math.round(temperatura * 10);
-
   const resp = await scriviProprieta(propId, valoreD10);
 
   return {
@@ -444,26 +641,14 @@ async function setSetpointZona(zona, temperatura, stagione) {
 async function setForzaturaZona(zona, modo) {
   const zonaNum = Number(zona);
   const mapping = ZONE_MAP[zonaNum];
-
-  if (!mapping) {
-    return { success: false, error: `Zona ${zonaNum} non presente nel mapping.` };
-  }
-
-  const FORZATURA_MAP = {
-    auto:    0,
-    off:     1,
-    economy: 2,
-    comfort: 3
-  };
+  if (!mapping) return { success: false, error: `Zona ${zonaNum} non presente nel mapping.` };
 
   const modoNorm = (modo || "").toLowerCase();
-  if (!(modoNorm in FORZATURA_MAP)) {
+  if (!(modoNorm in FORZATURA_MAP))
     return { success: false, error: `Modo non valido: "${modo}". Valori ammessi: auto, off, economy, comfort.` };
-  }
 
   const propId = `Z${zonaNum}_FORCING`;
   const valore = FORZATURA_MAP[modoNorm];
-
   const resp = await scriviProprieta(propId, valore);
 
   return {
@@ -473,9 +658,153 @@ async function setForzaturaZona(zona, modo) {
     appartamento: mapping.appartamento,
     modo_impostato: modoNorm,
     prop_id: propId,
-    valore: valore,
+    valore,
     status: resp.status,
     response: resp.response
+  };
+}
+
+// ============================================================
+// TOOL: set_impianto — AE-06
+// ============================================================
+
+async function setImpianto(stato) {
+  const statoNorm = (stato || "").toLowerCase();
+  if (statoNorm !== "on" && statoNorm !== "off")
+    return { success: false, error: `Stato non valido: "${stato}". Usare "on" o "off".` };
+
+  const valore = statoNorm === "on" ? 1 : 0;
+  const resp = await scriviProprieta("GLOBAL_ENABLE", valore);
+
+  return {
+    success: resp.success,
+    stato_impostato: statoNorm.toUpperCase(),
+    prop_id: "GLOBAL_ENABLE",
+    valore,
+    status: resp.status,
+    response: resp.response
+  };
+}
+
+// ============================================================
+// TOOL: set_stagione — AE-07
+// ============================================================
+
+async function setStagione(stagione) {
+  const stagNorm = (stagione || "").toLowerCase();
+  if (stagNorm !== "inverno" && stagNorm !== "estate")
+    return { success: false, error: `Stagione non valida: "${stagione}". Usare "inverno" o "estate".` };
+
+  const valore = stagNorm === "inverno" ? 0 : 1;
+  const resp = await scriviProprieta("GLOBAL_SEASON", valore);
+
+  return {
+    success: resp.success,
+    stagione_impostata: stagNorm,
+    prop_id: "GLOBAL_SEASON",
+    valore,
+    status: resp.status,
+    response: resp.response
+  };
+}
+
+// ============================================================
+// TOOL: set_appartamento — AE-08
+// ============================================================
+
+async function setAppartamento(appartamento, modo) {
+  const aptNorm = APPARTAMENTO_ORDER.find(
+    a => a.toLowerCase() === appartamento.toLowerCase()
+  );
+  if (!aptNorm) {
+    return {
+      success: false,
+      error: `Appartamento non trovato: "${appartamento}".`,
+      appartamenti_validi: APPARTAMENTO_ORDER
+    };
+  }
+
+  const modoNorm = (modo || "").toLowerCase();
+  if (!(modoNorm in FORZATURA_MAP))
+    return { success: false, error: `Modo non valido: "${modo}". Valori ammessi: auto, off, economy, comfort.` };
+
+  const zoneApt = Object.entries(ZONE_MAP)
+    .filter(([, v]) => v.appartamento === aptNorm)
+    .map(([k, v]) => ({ numero: Number(k), nome: v.nome }));
+
+  const pairs = zoneApt.map(z => ({ propId: `Z${z.numero}_FORCING`, valore: FORZATURA_MAP[modoNorm] }));
+  const { ok, error, results } = await authWriteMulti(pairs);
+
+  if (!ok) return { success: false, error };
+
+  return {
+    success: results.every(r => r.success),
+    appartamento: aptNorm,
+    modo_impostato: modoNorm,
+    zone_aggiornate: zoneApt.map((z, i) => ({
+      numero: z.numero,
+      nome: z.nome,
+      success: results[i].success,
+      status: results[i].status
+    }))
+  };
+}
+
+// ============================================================
+// TOOL: set_tutto_off — AE-09
+// ============================================================
+
+async function setTuttoOff() {
+  const pairs = Object.entries(ZONE_MAP).map(([k]) => ({
+    propId: `Z${k}_FORCING`,
+    valore: FORZATURA_MAP.off
+  }));
+
+  const { ok, error, results } = await authWriteMulti(pairs);
+  if (!ok) return { success: false, error };
+
+  const zone = Object.entries(ZONE_MAP).map(([k, v], i) => ({
+    numero: Number(k),
+    nome: v.nome,
+    appartamento: v.appartamento,
+    success: results[i].success
+  }));
+
+  return {
+    success: results.every(r => r.success),
+    operazione: "set_tutto_off",
+    zone_aggiornate: zone.length,
+    zone,
+    fallite: zone.filter(z => !z.success)
+  };
+}
+
+// ============================================================
+// TOOL: set_tutto_auto — AE-10
+// ============================================================
+
+async function setTuttoAuto() {
+  const pairs = Object.entries(ZONE_MAP).map(([k]) => ({
+    propId: `Z${k}_FORCING`,
+    valore: FORZATURA_MAP.auto
+  }));
+
+  const { ok, error, results } = await authWriteMulti(pairs);
+  if (!ok) return { success: false, error };
+
+  const zone = Object.entries(ZONE_MAP).map(([k, v], i) => ({
+    numero: Number(k),
+    nome: v.nome,
+    appartamento: v.appartamento,
+    success: results[i].success
+  }));
+
+  return {
+    success: results.every(r => r.success),
+    operazione: "set_tutto_auto",
+    zone_aggiornate: zone.length,
+    zone,
+    fallite: zone.filter(z => !z.success)
   };
 }
 
@@ -486,37 +815,102 @@ async function setForzaturaZona(zona, modo) {
 const TOOLS = [
   {
     name: "leggi_impianto",
-    description: "Legge tutti i dati live dell'impianto Cappellotto AlterEgo di Via Borgazzi 12: stato impianto, stagione, ACS, temperature zone (raggruppate per appartamento), setpoint, umidità, circuiti, allarmi.",
+    description: "Legge tutti i dati live dell'impianto Cappellotto AlterEgo di Via Borgazzi 12: stato impianto, stagione, temperature zone raggruppate per appartamento, setpoint, umidità, circuiti, allarmi.",
     inputSchema: { type: "object", properties: {}, required: [] }
   },
   {
+    name: "leggi_appartamento",
+    description: "Legge i dati live di un singolo appartamento. Appartamenti validi: Interrato, App. Piano Terra Sx, App. Piano Terra Dx, Piano Primo, Mansarda.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        appartamento: { type: "string", description: "Nome appartamento (es. 'Piano Primo')" }
+      },
+      required: ["appartamento"]
+    }
+  },
+  {
+    name: "leggi_allarmi",
+    description: "Legge solo gli allarmi attivi dell'impianto. Risposta leggera per check rapido.",
+    inputSchema: { type: "object", properties: {}, required: [] }
+  },
+  {
+    name: "check_anomalie",
+    description: "Diagnostica automatica sull'impianto: rileva allarmi attivi, umidità alta (rischio muffa ≥70%), rischio gelo (<8°C), sensori disconnessi su zone attive, delta temperatura anomalo tra zone dello stesso appartamento (>5°C).",
+    inputSchema: { type: "object", properties: {}, required: [] }
+  },
+  {
+    name: "set_impianto",
+    description: "Accende o spegne l'intero impianto Cappellotto (GLOBAL_ENABLE).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        stato: { type: "string", description: "'on' per accendere, 'off' per spegnere" }
+      },
+      required: ["stato"]
+    }
+  },
+  {
+    name: "set_stagione",
+    description: "Cambia la stagione dell'impianto tra inverno ed estate (GLOBAL_SEASON). Operazione critica — confermare sempre con l'utente prima di eseguire.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        stagione: { type: "string", description: "'inverno' o 'estate'" }
+      },
+      required: ["stagione"]
+    }
+  },
+  {
     name: "set_setpoint_zona",
-    description: "Imposta la temperatura di comfort di una zona. Specificare il numero zona (ricavabile da leggi_impianto), la temperatura in °C (range 5–35) e la stagione (inverno o estate, default inverno). Converte automaticamente in formato D10.",
+    description: "Imposta la temperatura di comfort di una singola zona. Numero zona ricavabile da leggi_impianto. Range: 5–35°C. Stagione default: inverno.",
     inputSchema: {
       type: "object",
       properties: {
         zona:        { type: "number", description: "Numero zona (es. 12 per Camera Piano Primo)" },
-        temperatura: { type: "number", description: "Temperatura di comfort in °C (es. 21.5). Range: 5–35." },
-        stagione:    { type: "string", description: "Stagione: 'inverno' (default) o 'estate'." }
+        temperatura: { type: "number", description: "Temperatura in °C (es. 21.5). Range: 5–35." },
+        stagione:    { type: "string", description: "'inverno' (default) o 'estate'" }
       },
       required: ["zona", "temperatura"]
     }
   },
   {
     name: "set_forzatura_zona",
-    description: "Imposta la modalità di forzatura di una zona. Specificare il numero zona e il modo desiderato: 'auto' (segue programma), 'off' (zona spenta), 'comfort' (forza comfort), 'economy' (forza economy).",
+    description: "Imposta la modalità di forzatura di una singola zona: auto (segue programma), off (zona spenta), comfort, economy.",
     inputSchema: {
       type: "object",
       properties: {
         zona: { type: "number", description: "Numero zona (es. 12 per Camera Piano Primo)" },
-        modo: { type: "string", description: "Modalità: 'auto', 'off', 'comfort', 'economy'" }
+        modo: { type: "string", description: "'auto', 'off', 'comfort', 'economy'" }
       },
       required: ["zona", "modo"]
     }
   },
   {
+    name: "set_appartamento",
+    description: "Imposta la stessa forzatura su tutte le zone di un appartamento in una sola operazione. Appartamenti: Interrato, App. Piano Terra Sx, App. Piano Terra Dx, Piano Primo, Mansarda.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        appartamento: { type: "string", description: "Nome appartamento (es. 'Piano Primo')" },
+        modo: { type: "string", description: "'auto', 'off', 'comfort', 'economy'" }
+      },
+      required: ["appartamento", "modo"]
+    }
+  },
+  {
+    name: "set_tutto_off",
+    description: "Spegne tutte le zone dell'impianto in una sola operazione (forzatura off su tutti gli appartamenti). Utile prima di assenze prolungate.",
+    inputSchema: { type: "object", properties: {}, required: [] }
+  },
+  {
+    name: "set_tutto_auto",
+    description: "Riporta tutte le zone dell'impianto in modalità automatica in una sola operazione. Speculare a set_tutto_off.",
+    inputSchema: { type: "object", properties: {}, required: [] }
+  },
+  {
     name: "scrivi_proprieta",
-    description: "Tool generico — usa solo per proprietà non coperte dai tool semantici. Proprietà comuni: GLOBAL_ENABLE (0/1), GLOBAL_SEASON (0=inverno/1=estate), GLOBAL_ACS_ENABLE (0/1), Z{n}_FORCING (0=auto/1=off/2=economy/3=comfort), Z{n}_SET_CW (setpoint comfort invernale D10), Z{n}_SET_CS (setpoint comfort estivo D10).",
+    description: "Tool generico — usa solo per proprietà non coperte dai tool semantici. Proprietà comuni: GLOBAL_ENABLE (0/1), GLOBAL_SEASON (0=inverno/1=estate), Z{n}_FORCING (0=auto/1=off/2=economy/3=comfort), Z{n}_SET_CW (setpoint comfort invernale D10), Z{n}_SET_CS (setpoint comfort estivo D10).",
     inputSchema: {
       type: "object",
       properties: {
@@ -554,23 +948,40 @@ async function handleToolCall(params) {
     let result;
     switch (name) {
       case "leggi_impianto":
-        result = await leggiImpianto();
-        break;
+        result = await leggiImpianto(); break;
+      case "leggi_appartamento":
+        if (!args?.appartamento) throw new Error("Parametro obbligatorio: appartamento");
+        result = await leggiAppartamento(args.appartamento); break;
+      case "leggi_allarmi":
+        result = await leggiAllarmi(); break;
+      case "check_anomalie":
+        result = await checkAnomalie(); break;
+      case "set_impianto":
+        if (!args?.stato) throw new Error("Parametro obbligatorio: stato");
+        result = await setImpianto(args.stato); break;
+      case "set_stagione":
+        if (!args?.stagione) throw new Error("Parametro obbligatorio: stagione");
+        result = await setStagione(args.stagione); break;
       case "set_setpoint_zona":
         if (args?.zona === undefined || args?.temperatura === undefined)
           throw new Error("Parametri obbligatori: zona, temperatura");
-        result = await setSetpointZona(args.zona, args.temperatura, args.stagione);
-        break;
+        result = await setSetpointZona(args.zona, args.temperatura, args.stagione); break;
       case "set_forzatura_zona":
         if (args?.zona === undefined || !args?.modo)
           throw new Error("Parametri obbligatori: zona, modo");
-        result = await setForzaturaZona(args.zona, args.modo);
-        break;
+        result = await setForzaturaZona(args.zona, args.modo); break;
+      case "set_appartamento":
+        if (!args?.appartamento || !args?.modo)
+          throw new Error("Parametri obbligatori: appartamento, modo");
+        result = await setAppartamento(args.appartamento, args.modo); break;
+      case "set_tutto_off":
+        result = await setTuttoOff(); break;
+      case "set_tutto_auto":
+        result = await setTuttoAuto(); break;
       case "scrivi_proprieta":
         if (!args?.prop_id || args?.valore === undefined)
           throw new Error("Parametri obbligatori: prop_id, valore");
-        result = await scriviProprieta(args.prop_id, args.valore);
-        break;
+        result = await scriviProprieta(args.prop_id, args.valore); break;
       default:
         throw new Error(`Tool sconosciuto: ${name}`);
     }
